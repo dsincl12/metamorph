@@ -10,7 +10,7 @@ import (
 
 // FileOpsToolDefinition defines the tool for file operations like copy, move, and rename
 var FileOperationsToolDefinition = ToolDefinition{
-	Name:        "fileops",
+	Name:        "file_operations",
 	Description: "Perform file operations such as copying, moving, and renaming files and directories.",
 	InputSchema: FileOpsToolInputSchema,
 	Function:    FileOpsTool,

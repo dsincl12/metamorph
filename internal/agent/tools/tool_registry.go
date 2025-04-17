@@ -11,7 +11,8 @@ import (
 )
 
 // ToolDefinition defines a tool that can be used by the agent.
-// Each tool has a name, description, input schema, and an implementation function.
+// Each tool represents a specific system capability with a unique name, descriptive explanation,
+// structured input schema, and an implementation function that can be invoked programmatically.
 type ToolDefinition struct {
 	// Name is the identifier of the tool used by Claude to invoke it
 	Name string `json:"name"`
@@ -55,5 +56,6 @@ func GetAllTools() []ToolDefinition {
 		ActionLimiterToolDefinition,
 		GitOperationsToolDefinition,
 		FileOperationsToolDefinition,
+		SearchWebToolDefinition,
 	}
 }

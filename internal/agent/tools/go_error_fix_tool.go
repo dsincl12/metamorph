@@ -9,7 +9,7 @@ import (
 
 // FixGoErrorsDefinition defines the fix_go_errors tool
 var GoErrorFixToolDefinition = ToolDefinition{
-	Name: "fix_go_errors",
+	Name: "go_error_fix",
 	Description: `Analyze Go compiler errors and suggest fixes.
 Given the error output from a Go command, this tool will analyze common errors
 and suggest how to fix them. It can help identify and fix issues like:

@@ -7,7 +7,7 @@ import (
 
 // GetTimeDefinition defines the get_time tool
 var TimeProviderToolDefinition = ToolDefinition{
-	Name:        "get_time",
+	Name:        "time_provider",
 	Description: "Get the current system time. Returns the current time in ISO 8601 format.",
 	InputSchema: GetTimeInputSchema,
 	Function:    GetTime,

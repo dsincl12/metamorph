@@ -9,7 +9,7 @@ import (
 
 // GitToolDefinition defines the git tool for common Git operations
 var GitOperationsToolDefinition = ToolDefinition{
-	Name:        "git",
+	Name:        "git_operations",
 	Description: "Execute common Git operations such as checking status, staging files, committing changes, pulling, pushing, viewing logs, creating branches, and more.",
 	InputSchema: GitToolInputSchema,
 	Function:    GitTool,

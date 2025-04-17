@@ -8,7 +8,7 @@ import (
 
 // WorkflowDefinition defines the workflow tool
 var RefactoringWorkflowToolDefinition = ToolDefinition{
-	Name: "refactor_workflow",
+	Name: "refactoring_workflow",
 	Description: `Execute a systematic refactoring workflow to avoid loops and ensure clean code changes.
 This tool helps implement a disciplined approach to refactoring that prevents common issues like:
 - Getting stuck in loops of file edits

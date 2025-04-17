@@ -11,7 +11,7 @@ import (
 
 // FileEditorDefinition defines the improved edit_file tool
 var FileEditorToolDefinition = ToolDefinition{
-	Name: "edit_file",
+	Name: "file_editor",
 	Description: `Make sophisticated edits to a text file.
 Multiple edit modes available:
 1. 'replace': Replace 'old_str' with 'new_str' in the file (requires exact match)

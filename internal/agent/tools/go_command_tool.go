@@ -12,7 +12,7 @@ import (
 
 // GoRunnerDefinition defines the run_go tool
 var GoCommandToolDefinition = ToolDefinition{
-	Name: "run_go",
+	Name: "go_command",
 	Description: `Execute Go commands like build, run, test, etc. and capture their output.
 Use this tool to compile and run Go code, identify errors, and test changes.
 Common commands:

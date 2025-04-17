@@ -8,7 +8,7 @@ import (
 
 // FileListerDefinition defines the list_files tool
 var FileListerToolDefinition = ToolDefinition{
-	Name:        "list_files",
+	Name:        "file_lister",
 	Description: "List files and directories at a given path. If no path is provided, lists files in the current directory.",
 	InputSchema: ListDirectoryContentsInputSchema,
 	Function:    ListDirectoryContents,
