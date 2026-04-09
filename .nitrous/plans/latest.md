@@ -1,70 +1,53 @@
 # Plan: Better HTTP Fetch Function
 
-## Context
-
-The only direct HTTP usage in this codebase is in `internal/agent/tools/search_web_tool.go`. The current implementation creates a bare `&http.Client{}` on every call to `SearchWeb`, with no timeout, no connection pooling, no retry logic, and no context propagation. This is the target of improvement.
-
----
-
 ## Problems with the Current Implementation
+
+The only direct HTTP usage is in `internal/agent/tools/search_web_tool.go`. Current issues:
 
 | Issue | Location | Impact |
 |---|---|---|
-| New `http.Client{}` per call | `search_web_tool.go:98` | No connection pooling; each call opens a new TCP connection |
-| No timeout set | `search_web_tool.go:98` | A hung server can block the goroutine indefinitely |
-| No retry logic | `search_web_tool.go:99` | Transient failures (5xx, network glitch) are not retried |
-| No context propagation | `search_web_tool.go:49` | Caller cannot cancel an in-flight request |
+| New `http.Client{}` per call | line 98 | No connection pooling; new TCP connection every call |
+| No timeout | line 98 | Hung server blocks goroutine indefinitely |
+| No retry logic | line 99 | Transient 5xx/network failures are not retried |
+| No context propagation | line 87 | Caller cannot cancel an in-flight request |
+| Manual gzip handling | lines 112–122 | Brittle; Go's transport does this automatically |
 
 ---
 
 ## Approach
 
-### 1. Create a shared `httpclient` package
+### 1. New file: `internal/httpclient/client.go`
 
-**New file**: `internal/httpclient/client.go`
+A shared package exposing:
 
-Expose a package-level singleton `http.Client` configured with:
-- A **30-second total timeout** (`http.Client.Timeout`)
-- A tuned `http.Transport` with sensible connection pool settings:
-  - `MaxIdleConns: 100`
-  - `MaxIdleConnsPerHost: 10`
-  - `IdleConnTimeout: 90s`
-  - `TLSHandshakeTimeout: 10s`
-  - `ExpectContinueTimeout: 1s`
+- A **package-level singleton** `DefaultClient *http.Client` configured with:
+  - `Timeout: 15 * time.Second`
+  - Tuned `http.Transport`: `MaxIdleConns: 100`, `MaxIdleConnsPerHost: 10`, `IdleConnTimeout: 90s`, `TLSHandshakeTimeout: 10s`
+  - The transport accepts an optional `http.RoundTripper` override for testing
 
-Also expose a `DoWithRetry` helper that wraps `client.Do` with:
-- Up to **3 attempts**
-- Retry only on: network errors, `429 Too Many Requests`, `500`, `502`, `503`, `504`
-- Exponential backoff: 500ms, 1s (jitter optional but recommended)
-- Context-aware: stop retrying if `ctx.Done()` fires
+- A `DoWithRetry(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error)` helper:
+  - Up to 3 attempts
+  - Retries on: network errors, 429, 500, 502, 503, 504
+  - Exponential backoff: 500ms → 1s between attempts
+  - Checks `ctx.Err()` before each attempt; returns immediately if context is cancelled
+  - Drains and closes `resp.Body` before retrying (to return TCP connection to pool)
+  - Only safe for idempotent methods (GET, HEAD); document this constraint
 
-```go
-// Signature
-func DoWithRetry(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error)
-```
+### 2. Update `internal/agent/tools/search_web_tool.go`
 
-Because `http.Request` bodies are consumed on first use, retries must use `GetBody` (set from a `bytes.NewReader` or left nil for GET requests).
+- Replace `http.NewRequest` with `http.NewRequestWithContext(ctx, ...)` — needs a `ctx` param
+- Replace `&http.Client{}` with `httpclient.DefaultClient`
+- Replace `client.Do(req)` with `httpclient.DoWithRetry(ctx, httpclient.DefaultClient, req)`
+- Remove manual gzip block (lines 112–122) — don't set `Accept-Encoding: gzip` header; let the transport decompress transparently
 
-### 2. Update `search_web_tool.go`
+### 3. Thread context through tool functions (Option A — recommended)
 
-- Change `SearchWeb` signature to accept `context.Context` as first argument:
-  ```go
-  func SearchWeb(ctx context.Context, input json.RawMessage) (string, error)
-  ```
-- Replace `http.NewRequest` with `http.NewRequestWithContext(ctx, ...)` so the request is tied to the caller's context.
-- Replace `&http.Client{}` with the package-level client from `internal/httpclient`.
-- Replace `client.Do(req)` with `httpclient.DoWithRetry(ctx, httpclient.DefaultClient, req)`.
+Change `ToolDefinition.Function` type from `func(json.RawMessage) (string, error)` to `func(context.Context, json.RawMessage) (string, error)`.
 
-### 3. Update `ToolDefinition` / function signature wiring
-
-**File**: `internal/agent/tools/tool_registry.go` (and `internal/agent/tools/search_web_tool.go`)
-
-The `ToolDefinition.Function` field currently has type `func(json.RawMessage) (string, error)`. Adding context requires either:
-
-- **Option A (preferred)**: Change the function type to `func(context.Context, json.RawMessage) (string, error)` and update all tool implementations and the call site in `agent.go`.
-- **Option B (simpler, lower risk)**: Keep the existing signature and capture context via closure when registering tools (pass `ctx` at registration time, not call time). This avoids touching every tool but means the context is the one from agent startup, not from the individual tool call — acceptable for timeouts, not ideal for cancellation.
-
-**Recommended**: Option A — threads a per-call context through cleanly and is the idiomatic Go approach. There are only ~11 tools; the change is mechanical.
+Update all affected files:
+- `internal/agent/tools/tool_registry.go` — update the type definition
+- `internal/agent/agent.go` — pass `ctx` when invoking tools
+- All `*_tool.go` files — update signatures (mechanical, compiler-enforced)
 
 ---
 
@@ -72,33 +55,32 @@ The `ToolDefinition.Function` field currently has type `func(json.RawMessage) (s
 
 | File | Change |
 |---|---|
-| `internal/httpclient/client.go` | **New file** — shared client + `DoWithRetry` |
-| `internal/agent/tools/search_web_tool.go` | Use shared client; add ctx param; use `NewRequestWithContext` |
-| `internal/agent/tools/tool_registry.go` | Update `ToolDefinition.Function` type if Option A chosen |
-| `internal/agent/agent.go` | Pass `ctx` when invoking tool functions (if Option A) |
-| All other `*_tool.go` files | Update signatures to match new `Function` type (Option A only; mechanical no-op changes) |
+| `internal/httpclient/client.go` | **New** — shared client + `DoWithRetry` |
+| `internal/agent/tools/search_web_tool.go` | Use shared client, add ctx, remove manual gzip |
+| `internal/agent/tools/tool_registry.go` | Update `Function` type to include `context.Context` |
+| `internal/agent/agent.go` | Pass `ctx` when calling tool functions |
+| All other `*_tool.go` files | Update signatures to match new `Function` type |
 
 ---
 
 ## Potential Risks
 
-1. **Retry on non-idempotent requests**: The Brave Search API is GET-only here, so retries are safe. Document in `DoWithRetry` that it must only be used for idempotent requests, or check the method explicitly.
-2. **Response body leak on retry**: Must `io.Copy(io.Discard, resp.Body); resp.Body.Close()` before retrying to return the connection to the pool.
-3. **Context cancellation vs. retry loop**: Retry loop must check `ctx.Err()` before each attempt and return immediately if the context is cancelled.
-4. **Signature change blast radius (Option A)**: All tool `Function` fields break at compile time until updated. The compiler catches every missed site, so this is safe — but the diff is larger.
-5. **`http.Transport` is not `http.RoundTripper`-interface-friendly for testing**: Consider accepting an `http.RoundTripper` in the client constructor to allow injection of a mock transport in tests.
+1. **Response body leak on retry**: Must drain + close `resp.Body` before each retry or the TCP connection won't return to the pool.
+2. **Removing gzip header breaks parsing**: Removing `Accept-Encoding: gzip` means Go's transport auto-decompresses; the body will already be plain JSON. Verify with a real API call.
+3. **Signature change blast radius**: All tool `Function` fields break at compile time until updated. The compiler catches every site — safe but the diff is larger. Go's type system makes this mechanical.
+4. **Retrying 429 without backoff respect**: If the API returns a `Retry-After` header, ideally honour it; minimum: apply backoff before retrying 429.
 
 ---
 
 ## Verification
 
 1. **Unit tests** — `internal/httpclient/client_test.go`:
-   - Mock `http.RoundTripper` that returns 500 twice then 200; assert `DoWithRetry` returns the 200 response.
-   - Mock that never returns; cancel context; assert `DoWithRetry` returns `context.Canceled`.
-   - Mock that hangs beyond 30s timeout (use `httptest.Server` with a sleep); assert timeout error.
+   - Mock `http.RoundTripper` returning 503 twice then 200; assert success after retries
+   - Cancel context mid-flight; assert `context.Canceled` is returned promptly
+   - Verify body is drained between retries (mock transport can track call count)
 
-2. **Integration smoke test** — set `BRAVE_API_KEY` and run a single search; confirm result is returned and the connection is reused (observable via `httpclient.DefaultClient.Transport.(*http.Transport)` stats, or just verify no regression).
+2. **Compile check**: `go build ./...` must pass after all signature updates.
 
-3. **Compile check** — `go build ./...` must pass with zero errors after all signature updates.
+3. **Race detector**: `go test -race ./...` — `http.Client` and `http.Transport` are goroutine-safe by design, but the test validates no regressions.
 
-4. **Race detector** — `go test -race ./...` to confirm the package-level client is safe for concurrent use (it is by design, but the test validates it).
+4. **Smoke test**: Set `BRAVE_API_KEY`, run a search query end-to-end, confirm JSON results are returned correctly (validates gzip change didn't break response parsing).
