@@ -1,0 +1,7 @@
+You are planning changes to this codebase. The task is:
+
+Add a better HTTP fetch function
+
+The existing HTTP client is not good enough, we need something better
+
+Read the relevant code and produce a plan at `.nitrous/plans/latest.md`. The plan should describe which files to change, the approach, potential risks, and how to verify the change works. When done, respond with a brief summary.

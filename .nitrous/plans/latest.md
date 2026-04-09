@@ -1,85 +1,118 @@
 # Plan: Better HTTP Fetch Function
 
-## Problems with the Current Implementation
+## Context
 
-The only direct HTTP usage is in `internal/agent/tools/search_web_tool.go`. Current issues:
+The existing HTTP client lives in `internal/httpclient/client.go` (121 lines). It provides:
+- A `DefaultClient` singleton with connection pooling and a 30s timeout
+- `DoWithRetry` with 3 fixed attempts, exponential backoff, and jitter
+- A `MaxBodyBytes` constant (10 MB) that callers must manually enforce
 
-| Issue | Location | Impact |
-|---|---|---|
-| New `http.Client{}` per call | line 98 | No connection pooling; new TCP connection every call |
-| No timeout | line 98 | Hung server blocks goroutine indefinitely |
-| No retry logic | line 99 | Transient 5xx/network failures are not retried |
-| No context propagation | line 87 | Caller cannot cancel an in-flight request |
-| Manual gzip handling | lines 112–122 | Brittle; Go's transport does this automatically |
-| No response body size limit | line 125 | Unbounded `io.ReadAll` can exhaust memory |
-
----
-
-## Approach
-
-### 1. New file: `internal/httpclient/client.go`
-
-A shared package exposing:
-
-- A **package-level singleton** `DefaultClient *http.Client` configured with:
-  - `Timeout: 30 * time.Second`
-  - Tuned `http.Transport`: `MaxIdleConns: 100`, `MaxIdleConnsPerHost: 10`, `IdleConnTimeout: 90s`, `TLSHandshakeTimeout: 10s`
-
-- A `DoWithRetry(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error)` helper:
-  - Up to 3 attempts
-  - Retries on: network errors, 429, 500, 502, 503, 504
-  - Exponential backoff: 500ms → 1s → 2s between attempts, with jitter
-  - Checks `ctx.Err()` before each attempt; returns immediately if context is cancelled
-  - Drains and closes `resp.Body` before retrying (to return TCP connection to pool)
-  - Only safe for idempotent methods (GET, HEAD); document this constraint
-  - Sets a default `User-Agent` header if none is present
-
-- A `MaxBodyBytes` constant (10 MB) used with `io.LimitReader` to bound response body reads
-
-### 2. Update `internal/agent/tools/search_web_tool.go`
-
-- Replace `http.NewRequest` with `http.NewRequestWithContext(context.Background(), ...)` (immediate win; context can be threaded in a follow-up)
-- Replace `&http.Client{}` with `httpclient.DefaultClient`
-- Replace `client.Do(req)` with `httpclient.DoWithRetry(ctx, httpclient.DefaultClient, req)`
-- Remove manual gzip block (lines 112–122) — don't set `Accept-Encoding: gzip` header; let the transport decompress transparently via Go's built-in handling
-- Wrap body read with `io.LimitReader(resp.Body, httpclient.MaxBodyBytes)`
+Key weaknesses identified:
+- All configuration is hardcoded — no per-call control over retry count, timeout, or backoff
+- No support for retrying requests with a body (POST/PUT/PATCH) — the body stream is consumed on the first attempt and cannot be replayed
+- `search_web_tool.go:88` passes `context.Background()` instead of the caller's `ctx`, silently ignoring cancellation and deadlines from the agent loop
+- No high-level convenience wrapper: callers must build the request, call `DoWithRetry`, then manually wrap the body in `io.LimitReader`
 
 ---
 
 ## Files to Change
 
 | File | Change |
-|---|---|
-| `internal/httpclient/client.go` | **New** — shared client, `DoWithRetry`, `MaxBodyBytes` |
-| `internal/agent/tools/search_web_tool.go` | Use shared client, add context, remove manual gzip, add body size limit |
+|------|--------|
+| `internal/httpclient/client.go` | Replace `DoWithRetry` with a configurable `Fetch` function using functional options; keep `DefaultClient` and `MaxBodyBytes` |
+| `internal/httpclient/client_test.go` | Update tests to cover the new API; add cases for body retry and custom options |
+| `internal/agent/tools/search_web_tool.go` | Switch to `Fetch`; fix `context.Background()` → caller `ctx` |
 
-No changes needed to `tool_registry.go`, `agent.go`, or other tool files. Threading context through the `Function` type is a larger refactor that can be done independently later.
+---
+
+## Approach
+
+### 1. Functional options for configuration
+
+Add an `Options` struct and `Option` functional-option type so callers override only what they need, with sensible defaults:
+
+```go
+type Options struct {
+    MaxAttempts    int           // default 3
+    InitialBackoff time.Duration // default 500ms
+    MaxBackoff     time.Duration // default 16s
+    BodySizeLimit  int64         // default MaxBodyBytes (10 MB)
+}
+
+type Option func(*Options)
+
+func WithMaxAttempts(n int) Option           { return func(o *Options) { o.MaxAttempts = n } }
+func WithInitialBackoff(d time.Duration) Option { ... }
+func WithBodySizeLimit(n int64) Option       { ... }
+```
+
+### 2. `Fetch` — high-level convenience function
+
+Replace `DoWithRetry` with `Fetch`, which owns the full request lifecycle:
+
+```go
+// Fetch executes req using client (DefaultClient if nil), retrying on transient
+// failures. It returns the response with Body limited to opts.BodySizeLimit.
+// The caller is responsible for closing resp.Body.
+func Fetch(ctx context.Context, client *http.Client, req *http.Request, opts ...Option) (*http.Response, error)
+```
+
+Internally it:
+1. Reads `req.Body` into `[]byte` once upfront (only when non-nil) so it can be replayed on each attempt
+2. Resets `req.Body` to a fresh `io.NopCloser(bytes.NewReader(buf))` before each attempt
+3. Applies exponential backoff with ±25% jitter between attempts (same algorithm as current code)
+4. Wraps the successful response body in `io.LimitReader` before returning
+5. Drains and closes `resp.Body` between retries (existing behaviour, preserved)
+
+Keeping the function signature close to the old `DoWithRetry` minimises the diff in call sites.
+
+### 3. Fix context propagation in `search_web_tool.go`
+
+`SearchWeb` already receives a `ctx` parameter but line 88 discards it:
+
+```go
+// Before (line 88):
+req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, searchURL, nil)
+
+// After:
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
+```
+
+Also update the `DoWithRetry` call (line 99) to `httpclient.Fetch(ctx, httpclient.DefaultClient, req)`.
 
 ---
 
 ## Potential Risks
 
-1. **Response body leak on retry**: Must drain + close `resp.Body` before each retry or the TCP connection won't return to the pool. Mitigate by using `io.Copy(io.Discard, resp.Body)` before `resp.Body.Close()`.
-
-2. **Removing gzip header changes response format**: Removing the explicit `Accept-Encoding: gzip` header means Go's transport handles decompression transparently. The body will arrive as plain JSON. Verify with a live API call that the existing JSON parsing still works.
-
-3. **Retrying 429 without honouring `Retry-After`**: Ideally parse the `Retry-After` header and sleep accordingly. At minimum, the exponential backoff provides partial protection.
-
-4. **Body size limit breaks large responses**: 10 MB is generous for JSON search results, but it's a named constant (`httpclient.MaxBodyBytes`) so it can be adjusted without code changes elsewhere.
+| Risk | Mitigation |
+|------|------------|
+| Buffering large request bodies increases peak memory | Document that `Fetch` is not suitable for streaming uploads; callers sending large bodies should use `WithMaxAttempts(1)` to skip body buffering |
+| Retry of non-idempotent methods (POST) may cause duplicate side effects | Document this clearly; callers that cannot tolerate duplicates should pass `WithMaxAttempts(1)` |
+| Renaming `DoWithRetry` → `Fetch` breaks call sites | Only one call site exists (`search_web_tool.go:99`); update it in the same change. Package is internal, so no external API concern |
+| Body buffering adds one extra allocation per request with a body | Negligible for the current use case (search API GET requests have no body) |
 
 ---
 
 ## Verification
 
-1. **Unit tests** — `internal/httpclient/client_test.go` using `net/http/httptest`:
-   - Mock server returning 503 twice then 200; assert success after 3 attempts
-   - Cancel context mid-flight; assert `context.Canceled` is returned promptly
-   - Verify body is drained between retries (mock transport tracks call count)
-   - Verify 404 is **not** retried (non-retryable status)
-   - Verify response larger than `MaxBodyBytes` is rejected
+1. **Unit tests** (`internal/httpclient/client_test.go`):
+   - Existing test cases ported to `Fetch` API
+   - New: success on retry with non-nil body (verifies body rewind works)
+   - New: `WithMaxAttempts(1)` disables retries
+   - New: `WithBodySizeLimit` truncates oversized responses
+   - Existing: context cancellation mid-retry exits immediately
 
-2. **Compile check**: `go build ./...` must pass.
+2. **Race detector**: `go test -race ./internal/httpclient/...` — validates no data races on the shared client
 
-3. **Race detector**: `go test -race ./...` — validates no data races in the shared client.
+3. **Compile check**: `go build ./...` passes clean
 
-4. **Smoke test**: Set `BRAVE_API_KEY`, run a search query end-to-end, confirm JSON results are returned correctly (validates the gzip change didn't break response parsing).
+4. **Smoke test**: With `BRAVE_API_KEY` set, run a search query end-to-end and confirm JSON results are returned correctly (validates context fix didn't break the happy path)
+
+---
+
+## Out of Scope
+
+- Circuit breaker / bulkhead patterns (separate concern, adds a dependency)
+- Metrics / tracing (no observability infrastructure exists yet)
+- `Retry-After` header parsing for 429 responses (backoff provides partial protection)
+- DNS caching (Go's default is adequate for current load)
