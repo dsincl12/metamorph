@@ -1,7 +1,7 @@
 package tools
 
 import (
-	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,7 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strings"
+
+	"metamorph/internal/httpclient"
 )
 
 // SearchWebToolDefinition defines the web search tool, currently implemented using Brave's Search API
@@ -83,20 +84,19 @@ func SearchWeb(input json.RawMessage) (string, error) {
 
 	requestURL := baseURL + "?" + params.Encode()
 
-	// Create a new request
-	req, err := http.NewRequest("GET", requestURL, nil)
+	// Create a new request with context so callers can cancel in-flight requests.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, requestURL, nil)
 	if err != nil {
 		return createErrorResponse(searchInput.Query, fmt.Sprintf("Failed to create request: %v", err)), nil
 	}
 
-	// Add required headers
+	// Add required headers. Omit Accept-Encoding so Go's transport handles
+	// transparent gzip decompression automatically.
 	req.Header.Add("Accept", "application/json")
-	req.Header.Add("Accept-Encoding", "gzip") // We explicitly request gzip encoding
 	req.Header.Add("X-Subscription-Token", apiKey)
 
-	// Create HTTP client and send request
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Send request using the shared client with retry logic.
+	resp, err := httpclient.DoWithRetry(context.Background(), httpclient.DefaultClient, req)
 	if err != nil {
 		return createErrorResponse(searchInput.Query, fmt.Sprintf("Search request failed: %v", err)), nil
 	}
@@ -104,25 +104,12 @@ func SearchWeb(input json.RawMessage) (string, error) {
 
 	// Check for HTTP errors
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, httpclient.MaxBodyBytes))
 		return createErrorResponse(searchInput.Query, fmt.Sprintf("Search API returned error code %d: %s", resp.StatusCode, string(bodyBytes))), nil
 	}
 
-	// Handle compressed responses
-	var reader io.ReadCloser
-	switch strings.ToLower(resp.Header.Get("Content-Encoding")) {
-	case "gzip":
-		reader, err = gzip.NewReader(resp.Body)
-		if err != nil {
-			return createErrorResponse(searchInput.Query, fmt.Sprintf("Failed to decompress gzipped response: %v", err)), nil
-		}
-		defer reader.Close()
-	default:
-		reader = resp.Body
-	}
-
-	// Read response body
-	body, err := io.ReadAll(reader)
+	// Read response body with a size limit to prevent unbounded memory usage.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, httpclient.MaxBodyBytes))
 	if err != nil {
 		return createErrorResponse(searchInput.Query, fmt.Sprintf("Failed to read search response: %v", err)), nil
 	}

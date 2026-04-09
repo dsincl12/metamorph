@@ -1,0 +1,12 @@
+{
+  "agent_type": "implementer",
+  "branch_name": "nitrous/ws-09268220",
+  "card_description": "The existing HTTP client is not good enough, we need something better",
+  "card_id": "15596b26-6c76-4a7c-a24d-adee233d45c4",
+  "card_title": "Add a better HTTP fetch function",
+  "column_id": "development",
+  "column_name": "Development",
+  "session_id": "8a215053-6cfd-4a45-8e31-4f71634bd8f4",
+  "session_type": "claude_code",
+  "workspace_id": "09268220-5936-441e-9083-fb8d6a0748ed"
+}
